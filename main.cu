@@ -8,29 +8,33 @@
 #include "hitable_list.h"
 #include "camera.h"
 #include "material.h"
+#include <cuda_fp16.h>
 
 #define MAT_LAMBERTIAN 0
 #define MAT_METAL 1
 #define MAT_DIELECTRIC 2
 
-struct Sphere // sphere struct to replace sphere : hitable class
+// struct to fill the world array with
+struct Sphere
 {
-    vec3 center;
-    float radius;
+    // Reduce precision, from floats to half
+    half x, y, z;
+    half radius;
 
-    int mat_type; // see definitions above
-    vec3 albedo;
-    float fuzz;
-    float ref_idx; // potentialy wasteful depending on material type, but we need all possible data
+    int mat_type;
+    half r, g, b;
+    half fuzz;
+    half ref_idx;
 };
 
-// helper function for the sphere hit quadratic calculation
+// helper function for the quadratic calculation from sphere.h
 __device__ bool hit_sphere(const Sphere &s, const ray &r, float t_min, float t_max, hit_record &rec)
 {
-    vec3 oc = r.origin() - s.center;
+    vec3 center(__half2float(s.x), __half2float(s.y), __half2float(s.z));
+    vec3 oc = r.origin() - center;
     float a = dot(r.direction(), r.direction());
     float b = dot(oc, r.direction());
-    float c = dot(oc, oc) - s.radius * s.radius;
+    float c = dot(oc, oc) - __half2float(s.radius) * __half2float(s.radius);
     float discriminant = b * b - a * c;
 
     if (discriminant > 0)
@@ -40,7 +44,7 @@ __device__ bool hit_sphere(const Sphere &s, const ray &r, float t_min, float t_m
         {
             rec.t = temp;
             rec.p = r.point_at_parameter(rec.t);
-            rec.normal = (rec.p - s.center) / s.radius;
+            rec.normal = (rec.p - center) / s.radius;
             return true;
         }
         temp = (-b + sqrt(discriminant)) / a;
@@ -48,31 +52,35 @@ __device__ bool hit_sphere(const Sphere &s, const ray &r, float t_min, float t_m
         {
             rec.t = temp;
             rec.p = r.point_at_parameter(rec.t);
-            rec.normal = (rec.p - s.center) / s.radius;
+            rec.normal = (rec.p - center) / s.radius;
             return true;
         }
     }
     return false;
 }
 
-// helper function version of all of the old
+// helper function for ray scattering which was previosly multiple virtual functions in material.h
 __device__ bool scatter(const Sphere &s, const ray &r_in, const hit_record &rec, vec3 &attenuation, ray &scattered, curandState *local_rand_state)
 {
-    if (s.mat_type == MAT_LAMBERTIAN) // lambertian scatter from material.h
+    vec3 albedo(__half2float(s.r), __half2float(s.g), __half2float(s.b));
+    float fuzz = __half2float(s.fuzz);
+    float ref_idx = __half2float(s.ref_idx);
+
+    if (s.mat_type == MAT_LAMBERTIAN) // lambertial material scatter
     {
         vec3 target = rec.p + rec.normal + random_in_unit_sphere(local_rand_state);
         scattered = ray(rec.p, target - rec.p);
-        attenuation = s.albedo;
+        attenuation = albedo;
         return true;
     }
-    else if (s.mat_type == MAT_METAL) // metal scatter logic
+    else if (s.mat_type == MAT_METAL) // metal scatter
     {
         vec3 reflected = reflect(unit_vector(r_in.direction()), rec.normal);
-        scattered = ray(rec.p, reflected + s.fuzz * random_in_unit_sphere(local_rand_state));
-        attenuation = s.albedo;
+        scattered = ray(rec.p, reflected + fuzz * random_in_unit_sphere(local_rand_state));
+        attenuation = albedo;
         return (dot(scattered.direction(), rec.normal) > 0);
     }
-    else if (s.mat_type == MAT_DIELECTRIC) // glass scatter logic
+    else if (s.mat_type == MAT_DIELECTRIC) // glass scatter
     {
         vec3 outward_normal;
         vec3 reflected = reflect(r_in.direction(), rec.normal);
@@ -82,22 +90,23 @@ __device__ bool scatter(const Sphere &s, const ray &r_in, const hit_record &rec,
         float reflect_prob;
         float cosine;
 
+        // this logic is taken from the material.h implementations
         if (dot(r_in.direction(), rec.normal) > 0)
         {
             outward_normal = -rec.normal;
-            ni_over_nt = s.ref_idx;
-            cosine = s.ref_idx * dot(r_in.direction(), rec.normal) / r_in.direction().length();
+            ni_over_nt = ref_idx;
+            cosine = ref_idx * dot(r_in.direction(), rec.normal) / r_in.direction().length();
         }
         else
         {
             outward_normal = rec.normal;
-            ni_over_nt = 1.0 / s.ref_idx;
+            ni_over_nt = 1.0 / ref_idx;
             cosine = -dot(r_in.direction(), rec.normal) / r_in.direction().length();
         }
 
         if (refract(r_in.direction(), outward_normal, ni_over_nt, refracted))
         {
-            reflect_prob = schlick(cosine, s.ref_idx);
+            reflect_prob = schlick(cosine, ref_idx);
         }
         else
         {
@@ -135,6 +144,8 @@ void check_cuda(cudaError_t result, char const *const func, const char *const fi
 // it was blowing up the stack, so we have to turn this into a
 // limited-depth loop instead.  Later code in the book limits to a max
 // depth of 50, so we adapt this a few chapters early on the GPU.
+
+// since we are now looping over the spheres in a for loop, we pass the number of spheres to color()
 __device__ vec3 color(const ray &r, Sphere *spheres, int num_spheres, curandState *local_rand_state)
 {
     ray cur_ray = r;
@@ -147,7 +158,7 @@ __device__ vec3 color(const ray &r, Sphere *spheres, int num_spheres, curandStat
         float closest_so_far = FLT_MAX;
         int hit_index = -1;
 
-        // over ALL spheres to find the closest hit
+        // new: over ALL spheres to find the closest hit
         for (int i = 0; i < num_spheres; i++)
         {
             hit_record temp_rec;
@@ -225,7 +236,7 @@ __global__ void render(vec3 *fb, int max_x, int max_y, int ns, camera **cam, Sph
         float u = float(i + curand_uniform(&local_rand_state)) / float(max_x);
         float v = float(j + curand_uniform(&local_rand_state)) / float(max_y);
         ray r = (*cam)->get_ray(u, v, &local_rand_state);
-        col += color(r, world, num_spheres, &local_rand_state);
+        col += color(r, world, num_spheres, &local_rand_state); // num_spheres passed as arg
     }
     rand_state[pixel_index] = local_rand_state;
     col /= float(ns);
@@ -244,10 +255,15 @@ __global__ void create_world(Sphere *d_spheres, int num_spheres, camera **d_came
         curandState local_rand_state = *rand_state;
 
         // Ground
-        d_spheres[0].center = vec3(0, -1000.0, -1);
-        d_spheres[0].radius = 1000;
+        // Reduce/mixed precision implementation
+        d_spheres[0].x = __float2half(0.0f);
+        d_spheres[0].y = __float2half(-1000.0f);
+        d_spheres[0].z = __float2half(-1.0f);
+        d_spheres[0].radius = __float2half(1000.0f);
         d_spheres[0].mat_type = MAT_LAMBERTIAN;
-        d_spheres[0].albedo = vec3(0.5, 0.5, 0.5);
+        d_spheres[0].r = __float2half(0.5f);
+        d_spheres[0].g = __float2half(0.5f);
+        d_spheres[0].b = __float2half(0.5f);
 
         int i = 1;
         for (int a = -11; a < 11; a++)
@@ -256,47 +272,72 @@ __global__ void create_world(Sphere *d_spheres, int num_spheres, camera **d_came
             {
                 float choose_mat = RND;
                 vec3 center(a + RND, 0.2, b + RND);
-                d_spheres[i].center = center;
-                d_spheres[i].radius = 0.2;
+
+                // Reduce/mixed precision implementation
+                d_spheres[i].x = __float2half(center.x());
+                d_spheres[i].y = __float2half(center.y());
+                d_spheres[i].z = __float2half(center.z());
+                d_spheres[i].radius = __float2half(0.2f);
 
                 if (choose_mat < 0.8f)
                 { // Lambertian
+                    // Reduce/mixed precision implementation
                     d_spheres[i].mat_type = MAT_LAMBERTIAN;
-                    d_spheres[i].albedo = vec3(RND * RND, RND * RND, RND * RND);
+                    d_spheres[i].r = __float2half(RND * RND);
+                    d_spheres[i].g = __float2half(RND * RND);
+                    d_spheres[i].b = __float2half(RND * RND);
                 }
                 else if (choose_mat < 0.95f)
                 { // Metal
+                    // Reduce/mixed precision implementation
                     d_spheres[i].mat_type = MAT_METAL;
-                    d_spheres[i].albedo = vec3(0.5f * (1.0f + RND), 0.5f * (1.0f + RND), 0.5f * (1.0f + RND));
-                    d_spheres[i].fuzz = 0.5f * RND;
+                    d_spheres[i].r = __float2half(0.5f * (1.0f + RND));
+                    d_spheres[i].g = __float2half(0.5f * (1.0f + RND));
+                    d_spheres[i].b = __float2half(0.5f * (1.0f + RND));
+                    d_spheres[i].fuzz = __float2half(0.5f * RND);
                 }
                 else
                 { // Glass
+                    // Reduce/mixed precision implementation
                     d_spheres[i].mat_type = MAT_DIELECTRIC;
-                    d_spheres[i].ref_idx = 1.5;
+                    d_spheres[i].ref_idx = __float2half(1.5f);
                 }
                 i++;
             }
         }
 
-        // The 3 big spheres
-        d_spheres[i].center = vec3(0, 1, 0);
-        d_spheres[i].radius = 1.0;
+        // The 3 big spheres with
+        // Reduced Precision implementation
+        // 1
+        d_spheres[i].x = __float2half(0.0f);
+        d_spheres[i].y = __float2half(1.0f);
+        d_spheres[i].z = __float2half(0.0f);
+        d_spheres[i].radius = __float2half(1.0f);
         d_spheres[i].mat_type = MAT_DIELECTRIC;
-        d_spheres[i].ref_idx = 1.5;
+        d_spheres[i].ref_idx = __float2half(1.5f);
         i++;
 
-        d_spheres[i].center = vec3(-4, 1, 0);
-        d_spheres[i].radius = 1.0;
+        // 2
+        d_spheres[i].x = __float2half(-4.0f);
+        d_spheres[i].y = __float2half(1.0f);
+        d_spheres[i].z = __float2half(0.0f);
+        d_spheres[i].radius = __float2half(1.0f);
         d_spheres[i].mat_type = MAT_LAMBERTIAN;
-        d_spheres[i].albedo = vec3(0.4, 0.2, 0.1);
+        d_spheres[i].r = __float2half(0.4f);
+        d_spheres[i].g = __float2half(0.2f);
+        d_spheres[i].b = __float2half(0.1f);
         i++;
 
-        d_spheres[i].center = vec3(4, 1, 0);
-        d_spheres[i].radius = 1.0;
+        // 3
+        d_spheres[i].x = __float2half(4.0f);
+        d_spheres[i].y = __float2half(1.0f);
+        d_spheres[i].z = __float2half(0.0f);
+        d_spheres[i].radius = __float2half(1.0f);
         d_spheres[i].mat_type = MAT_METAL;
-        d_spheres[i].albedo = vec3(0.7, 0.6, 0.5);
-        d_spheres[i].fuzz = 0.0;
+        d_spheres[i].r = __float2half(0.7f);
+        d_spheres[i].g = __float2half(0.6f);
+        d_spheres[i].b = __float2half(0.5f);
+        d_spheres[i].fuzz = __float2half(0.0f);
 
         *rand_state = local_rand_state;
 
